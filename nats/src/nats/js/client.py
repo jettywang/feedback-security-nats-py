@@ -148,7 +148,10 @@ class JetStreamContext(JetStreamManager):
         await self._nc.subscribe(async_reply_subject.decode(), cb=self._handle_async_reply)
 
     async def _handle_async_reply(self, msg: Msg) -> None:
-        token = msg.subject[len(self._nc._inbox_prefix) + 22 + 2 :]
+        # Derive the per-request token from the actual reply subscription
+        # prefix instead of assuming the default "_INBOX" prefix length, so
+        # custom (and multi-tenant) inbox prefixes are supported.
+        token = msg.subject[len(self._async_reply_prefix) :]
         future = self._publish_async_futures.get(token)
 
         if not future:

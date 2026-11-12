@@ -148,6 +148,30 @@ def _validate_queue(queue: str) -> None:
         raise errors.BadSubjectError
 
 
+def _validate_inbox_prefix(inbox_prefix: bytes) -> bytes:
+    """Validate and normalize a custom inbox prefix.
+
+    Multi-tenant deployments authorize each client to subscribe only under its
+    own inbox prefix, so the prefix must name a concrete subject hierarchy.
+    Reject empty prefixes, wildcard tokens, empty/leading/double separators and
+    any whitespace or control characters; a trailing dot (or dots) is
+    normalized away since callers commonly pass either form.
+    """
+    if not isinstance(inbox_prefix, bytes) or not inbox_prefix:
+        raise errors.BadInboxPrefixError
+    if any(ch in inbox_prefix for ch in (b" ", b"\t", b"\r", b"\n")):
+        raise errors.BadInboxPrefixError
+    # Normalize trailing separators first ("tenant." and "tenant.." are
+    # equivalent) so only leading and embedded empty tokens are rejected.
+    normalized = inbox_prefix.rstrip(b".")
+    if not normalized or normalized.startswith(b".") or b".." in normalized:
+        raise errors.BadInboxPrefixError
+    for token in normalized.split(b"."):
+        if not token or b"*" in token or b">" in token:
+            raise errors.BadInboxPrefixError
+    return normalized
+
+
 # Header keys must be printable ASCII without separators (RFC 7230 token
 # characters); anything else, CRLF in particular, is rejected outright.
 _HEADER_KEY_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
@@ -556,7 +580,7 @@ class Client:
         if isinstance(inbox_prefix, str):
             inbox_prefix = inbox_prefix.encode()
         assert isinstance(inbox_prefix, bytes)
-        self._inbox_prefix = bytearray(inbox_prefix)
+        self._inbox_prefix = bytearray(_validate_inbox_prefix(inbox_prefix))
 
         # NKEYS support
         self._signature_cb = signature_cb
@@ -1123,7 +1147,11 @@ class Client:
         await self.subscribe(resp_mux_subject.decode(), cb=self._request_sub_callback)
 
     async def _request_sub_callback(self, msg: Msg) -> None:
-        token = msg.subject[len(self._inbox_prefix) + 22 + 2 :]
+        # Derive the per-request token relative to the actual mux
+        # subscription rather than assuming the default "_INBOX" prefix
+        # length, so custom (and multi-tenant) inbox prefixes work regardless
+        # of how long they are.
+        token = msg.subject[len(self._resp_sub_prefix) :]
         future = self._resp_map.get(token)
 
         if not future:

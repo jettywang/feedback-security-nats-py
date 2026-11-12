@@ -84,6 +84,11 @@ class BadSubjectError(Error):
         return "nats: invalid subject"
 
 
+class BadInboxPrefixError(Error):
+    def __str__(self) -> str:
+        return "nats: invalid inbox prefix"
+
+
 class BadHeaderError(Error):
     def __init__(self, key: str = "") -> None:
         self.key = key
