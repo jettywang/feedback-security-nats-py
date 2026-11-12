@@ -688,14 +688,32 @@ class Client:
 
             self._signature_cb = sig_cb
         elif isinstance(creds, str) or isinstance(creds, UserString) or isinstance(creds, Path):
-            # Define the functions to be able to sign things using nkeys.
+            # The JWT callback and the signature callback used to open the
+            # credentials file independently. A credentials rotation that
+            # landed between those two reads made a single CONNECT carry a
+            # JWT from the new generation and a signature from the old one.
+            # Take one snapshot per CONNECT and derive both sections from it
+            # so they are guaranteed to belong to the same generation. The
+            # signature callback always runs first (see _connect_command),
+            # so it produces the snapshot and the JWT callback consumes it.
+            connect_state: Dict[str, Any] = {"snapshot": None}
+
             def user_cb() -> bytearray:
-                return self._read_creds_user_jwt(creds)
+                snapshot = connect_state["snapshot"]
+                connect_state["snapshot"] = None
+                if snapshot is None:
+                    # Defensive: invoked without a prior signature callback.
+                    snapshot = self._read_creds_snapshot(creds)
+                return self._parse_creds_user_jwt(BytesIO(snapshot))
 
             self._user_jwt_cb = user_cb
 
             def sig_cb(nonce: str) -> bytes:
-                user_seed = self._read_creds_user_nkey(creds)
+                # One open/read for the whole file; the JWT callback reuses
+                # exactly these bytes and never touches disk again.
+                snapshot = self._read_creds_snapshot(creds)
+                connect_state["snapshot"] = snapshot
+                user_seed = self._parse_creds_user_nkey(BytesIO(snapshot))
                 kp = nkeys.from_seed(user_seed)
                 raw_signed = kp.sign(nonce.encode())
                 sig = base64.b64encode(raw_signed)
@@ -708,50 +726,61 @@ class Client:
 
             self._signature_cb = sig_cb
 
-    def _read_creds_user_nkey(self, creds: str | UserString | Path) -> bytearray:
-        def get_user_seed(f):
-            for line in f:
-                # Detect line where the NKEY would start and end,
-                # then seek and read into a fixed bytearray that
-                # can be wiped.
-                if b"BEGIN USER NKEY SEED" in line:
-                    nkey_start_pos = f.tell()
-                    try:
-                        next(f)
-                    except StopIteration:
-                        raise ErrInvalidUserCredentials
-                    nkey_end_pos = f.tell()
-                    nkey_size = nkey_end_pos - nkey_start_pos - 1
-                    f.seek(nkey_start_pos)
-
-                    # Only gather enough bytes for the user seed
-                    # into the pre allocated bytearray.
-                    user_seed = bytearray(nkey_size)
-                    f.readinto(user_seed)  # type: ignore[attr-defined]
-                    return user_seed
-
+    def _read_creds_snapshot(self, creds: str | UserString | Path) -> bytes:
+        """
+        Read the whole credentials file in a single open/read so that the
+        JWT and the user nkey seed used by one CONNECT always come from the
+        same credential generation. Reading them through two separate opens
+        allows a credentials rotation that lands between the reads to pair a
+        JWT from one generation with a signature from another.
+        """
         if isinstance(creds, UserString):
-            return get_user_seed(BytesIO(creds.data.encode()))
-
-        with open(creds, "rb", buffering=0) as f:
-            return get_user_seed(f)
-
-    def _read_creds_user_jwt(self, creds: str | RawCredentials | Path):
-        def get_user_jwt(f):
-            user_jwt = None
-            while True:
-                line = bytearray(f.readline())
-                if b"BEGIN NATS USER JWT" in line:
-                    user_jwt = bytearray(f.readline())
-                    break
-            # Remove trailing line break but reusing same memory view.
-            return user_jwt[: len(user_jwt) - 1]
-
-        if isinstance(creds, UserString):
-            return get_user_jwt(BytesIO(creds.data.encode()))
+            return creds.data.encode()
 
         with open(creds, "rb") as f:
-            return get_user_jwt(f)
+            return f.read()
+
+    def _parse_creds_user_nkey(self, f) -> bytearray:
+        for line in f:
+            # Detect line where the NKEY would start and end,
+            # then seek and read into a fixed bytearray that
+            # can be wiped.
+            if b"BEGIN USER NKEY SEED" in line:
+                nkey_start_pos = f.tell()
+                try:
+                    next(f)
+                except StopIteration:
+                    raise ErrInvalidUserCredentials
+                nkey_end_pos = f.tell()
+                nkey_size = nkey_end_pos - nkey_start_pos - 1
+                f.seek(nkey_start_pos)
+
+                # Only gather enough bytes for the user seed
+                # into the pre allocated bytearray.
+                user_seed = bytearray(nkey_size)
+                f.readinto(user_seed)  # type: ignore[attr-defined]
+                return user_seed
+        raise ErrInvalidUserCredentials
+
+    def _read_creds_user_nkey(self, creds: str | UserString | Path) -> bytearray:
+        snapshot = self._read_creds_snapshot(creds)
+        return self._parse_creds_user_nkey(BytesIO(snapshot))
+
+    def _parse_creds_user_jwt(self, f) -> bytearray:
+        user_jwt = None
+        while True:
+            line = bytearray(f.readline())
+            if not line:
+                raise ErrInvalidUserCredentials
+            if b"BEGIN NATS USER JWT" in line:
+                user_jwt = bytearray(f.readline())
+                break
+        # Remove trailing line break but reusing same memory view.
+        return user_jwt[: len(user_jwt) - 1]
+
+    def _read_creds_user_jwt(self, creds: str | RawCredentials | Path):
+        snapshot = self._read_creds_snapshot(creds)
+        return self._parse_creds_user_jwt(BytesIO(snapshot))
 
     def _setup_nkeys_seed_connect(self) -> None:
         assert self._nkeys_seed or self._nkeys_seed_str, "Client.connect must be called first"
