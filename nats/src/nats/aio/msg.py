@@ -143,6 +143,9 @@ class Msg:
         """
         if self.reply is None or self.reply == "":
             raise NotJSMessageError
+        # Reject reply subjects that are not JetStream acks so that an ack
+        # payload is never published to an arbitrary business subject.
+        self._get_metadata_fields(self.reply)
         await self._client.publish(self.reply, Msg.Ack.Progress)
 
     async def term(self) -> None:
@@ -177,6 +180,9 @@ class Msg:
             raise NotJSMessageError
         if self._ackd:
             raise MsgAlreadyAckdError(self)
+        # Only a JetStream ack reply subject may receive an ack payload.
+        # Reuse the metadata parser so both agree on what a valid delivery is.
+        self._get_metadata_fields(self.reply)
 
     @dataclass(frozen=True)
     class Metadata:
@@ -215,13 +221,32 @@ class Msg:
             if not reply:
                 raise NotJSMessageError
             tokens = reply.split(".")
-            if (
+            if not (
                 (len(tokens) == _V1_TOKEN_COUNT or len(tokens) >= _V2_TOKEN_COUNT - 1)
                 and tokens[0] == Msg.Ack.Prefix0
                 and tokens[1] == Msg.Ack.Prefix1
             ):
-                return tokens
-            raise NotJSMessageError
+                raise NotJSMessageError
+
+            # Sequence, delivery, timestamp and pending fields must all be
+            # integers, otherwise the reply is not a JetStream ack subject.
+            if len(tokens) == _V1_TOKEN_COUNT:
+                # $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm>.<pending>
+                numeric_fields = (4, 5, 6, 7, 8)
+            else:
+                numeric_fields = (
+                    Msg.Ack.NumDelivered,
+                    Msg.Ack.StreamSeq,
+                    Msg.Ack.ConsumerSeq,
+                    Msg.Ack.Timestamp,
+                    Msg.Ack.NumPending,
+                )
+            try:
+                for index in numeric_fields:
+                    int(tokens[index])
+            except (ValueError, IndexError):
+                raise NotJSMessageError
+            return tokens
 
         @classmethod
         def _from_reply(cls, reply: str) -> Msg.Metadata:
