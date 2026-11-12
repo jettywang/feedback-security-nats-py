@@ -47,9 +47,33 @@ class Msg:
     data: bytes = b""
     headers: Optional[Dict[str, str]] = None
 
+    # Status parsed from the protocol status line of an HMSG header block
+    # (e.g. ``NATS/1.0 503 No Responders``). These stay separate from
+    # ``headers`` so a business-level ``Status`` header can never be mistaken
+    # for a protocol-level status such as the server's no-responders reply.
+    status: Optional[str] = None
+    description: Optional[str] = None
+
     _metadata: Optional[Metadata] = None
     _ackd: bool = False
     _sid: Optional[int] = None
+
+    @property
+    def status_code(self) -> Optional[str]:
+        """
+        status_code returns the protocol status line code of the message
+        (e.g. ``"503"`` for a no-responders reply) or ``None`` when the
+        message was delivered without a protocol status line.
+        """
+        return self.status
+
+    @property
+    def status_description(self) -> Optional[str]:
+        """
+        status_description returns the description of the protocol status
+        line (e.g. ``"No Responders"``) or ``None`` when absent.
+        """
+        return self.description
 
     class Ack:
         Ack = b"+ACK"

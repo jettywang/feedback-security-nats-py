@@ -1156,7 +1156,7 @@ class Client:
             return await self._request_old_style(subject, payload, timeout=timeout)
         else:
             msg = await self._request_new_style(subject, payload, timeout=timeout, headers=headers)
-        if msg.headers and msg.headers.get(nats.js.api.Header.STATUS) == NO_RESPONDERS_STATUS:
+        if msg.status == NO_RESPONDERS_STATUS:
             raise errors.NoRespondersError
         return msg
 
@@ -1226,9 +1226,8 @@ class Client:
 
         try:
             msg = await asyncio.wait_for(future, timeout)
-            if msg.headers:
-                if msg.headers.get(nats.js.api.Header.STATUS) == NO_RESPONDERS_STATUS:
-                    raise errors.NoRespondersError
+            if msg.status == NO_RESPONDERS_STATUS:
+                raise errors.NoRespondersError
             return msg
         except asyncio.TimeoutError:
             await sub.unsubscribe()
@@ -1945,19 +1944,58 @@ class Client:
             out[key] = value.strip().decode("utf-8", "replace")
         return out
 
-    def _is_control_message(self, data, header: Dict[str, str]) -> Optional[str]:
+    def _is_control_message(self, data, header: Dict[str, str], status: Optional[str] = None) -> Optional[str]:
         if len(data) > 0:
             return None
-        status = header.get(nats.js.api.Header.STATUS)
+        # Only the protocol status line can turn a message into a JetStream
+        # control message; a business-level ``Status: 100`` header must not.
+        if status is None:
+            status = header.get(nats.js.api.Header.STATUS)
         if status == CTRL_STATUS:
             return header.get(nats.js.api.Header.DESCRIPTION)
         return None
 
     async def _process_headers(self, headers) -> Optional[Dict[str, str]]:
-        if not headers:
-            return None
+        """Parse an HMSG header block into business headers.
 
-        hdr: Optional[Dict[str, str]] = None
+        Backwards-compatible wrapper around `_parse_headers`: the protocol
+        status line (e.g. ``NATS/1.0 503 No Responders``) is still exposed via
+        the synthetic ``Status``/``Description`` keys so existing callers keep
+        working. New code should use `_parse_headers` and the returned status
+        to distinguish the protocol status line from same-named business
+        headers.
+        """
+        hdr, status, description = await self._parse_headers(headers)
+        if status is None:
+            return hdr
+        if hdr is None:
+            hdr = {}
+        # Preserve the historical contract: surface the protocol status line
+        # via the synthetic headers without overwriting a business header that
+        # happens to use the same name.
+        hdr.setdefault(nats.js.api.Header.STATUS.value, status)
+        if description is not None:
+            hdr.setdefault(nats.js.api.Header.DESCRIPTION.value, description)
+        return hdr or None
+
+    async def _parse_headers(
+        self, headers: Optional[bytes]
+    ) -> Tuple[Optional[Dict[str, str]], Optional[str], Optional[str]]:
+        """Parse an HMSG header block.
+
+        Returns a ``(headers, status, description)`` tuple where ``status`` and
+        ``description`` come exclusively from the protocol status line (the
+        first line of the block, e.g. ``NATS/1.0 503 No Responders``). Business
+        headers — including any application-level ``Status``/``Description``
+        entries — stay in ``headers`` and can never be confused with the
+        protocol status.
+        """
+        if not headers:
+            return None, None, None
+
+        hdr: Dict[str, str] = {}
+        status: Optional[str] = None
+        description: Optional[str] = None
         raw_headers = headers[NATS_HDR_LINE_SIZE:]
 
         # If the first character is an empty space, then this is
@@ -1975,14 +2013,14 @@ class Client:
         if raw_headers[0] == _SPC_BYTE_:
             # Special handling for status messages.
             line = headers[len(NATS_HDR_LINE) + 1 :]
-            status = line[:STATUS_MSG_LEN]
+            inline_status = line[:STATUS_MSG_LEN]
             desc = line[STATUS_MSG_LEN + 1 : len(line) - _CRLF_LEN_ - _CRLF_LEN_]
-            stripped_status = status.strip().decode()
+            stripped_status = inline_status.strip().decode()
 
+            # Track the protocol status separately from business headers.
             # Process as status only when it is a valid integer.
-            hdr = {}
             if stripped_status.isdigit():
-                hdr[nats.js.api.Header.STATUS.value] = stripped_status
+                status = stripped_status
 
             # Move the raw_headers to end of line
             i = raw_headers.find(_CRLF_)
@@ -1993,14 +2031,14 @@ class Client:
                 # check that there are no pending headers to be parsed.
                 i = desc.find(_CRLF_)
                 if i > 0:
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc[:i].decode()
+                    description = desc[:i].decode()
                     hdr.update(self._parse_header_lines(desc[i + _CRLF_LEN_ :]))
                 else:
                     # Just inline status...
-                    hdr[nats.js.api.Header.DESCRIPTION] = desc.decode()
+                    description = desc.decode()
 
         if not len(raw_headers) > _CRLF_LEN_:
-            return hdr
+            return (hdr or None), status, description
 
         #
         # Example header without status:
@@ -2013,10 +2051,7 @@ class Client:
                 parsed_hdr = parse_email(raw_headers).headers
             else:
                 parsed_hdr = self._parse_header_lines(raw_headers)
-            if hdr:
-                hdr.update(parsed_hdr)
-            else:
-                hdr = parsed_hdr
+            hdr.update(parsed_hdr)
 
             if parse_email:
                 to_delete = []
@@ -2028,9 +2063,9 @@ class Client:
 
         except Exception as e:
             await self._error_cb(e)
-            return hdr
+            return (hdr or None), status, description
 
-        return hdr or None
+        return (hdr or None), status, description
 
     async def _process_msg(
         self,
@@ -2060,8 +2095,8 @@ class Client:
             # message is processed.
             self._subs.pop(sid, None)
 
-        hdr = await self._process_headers(headers)
-        msg = self._build_message(sid, subject, reply, data, hdr)
+        hdr, status, description = await self._parse_headers(headers)
+        msg = self._build_message(sid, subject, reply, data, hdr, status, description)
         if not msg:
             return
 
@@ -2077,7 +2112,7 @@ class Client:
             jsi = sub._jsi
             jsi._active = True
             if hdr:
-                ctrl_msg = self._is_control_message(data, hdr)
+                ctrl_msg = self._is_control_message(data, hdr, status)
 
                 # Check if the heartbeat has a "Consumer Stalled" header, if
                 # so, the value is the FC reply to send a nil message to.
@@ -2162,12 +2197,16 @@ class Client:
         reply: bytes,
         data: bytes,
         headers: Optional[Dict[str, str]],
+        status: Optional[str] = None,
+        description: Optional[str] = None,
     ):
         return self.msg_class(
             subject=subject.decode(),
             reply=reply.decode(),
             data=data,
             headers=headers,
+            status=status,
+            description=description,
             _client=self,
             _sid=sid,
         )

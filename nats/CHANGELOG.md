@@ -5,6 +5,12 @@ All notable changes to `nats-py` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A normal reply carrying a business-level `Status: 503` header no longer raises `NoRespondersError`. The protocol status line (e.g. `NATS/1.0 503 No Responders`) is now parsed separately from business headers and exposed via `Msg.status`/`Msg.status_code` and `Msg.description`/`Msg.status_description`, so only a genuine server no-responders reply triggers the error.
+
 ## [2.16.0] - 2026-09-14
 
 ### Added

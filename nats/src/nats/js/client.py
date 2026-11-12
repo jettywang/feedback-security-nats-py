@@ -158,7 +158,7 @@ class JetStreamContext(JetStreamManager):
             return
 
         # Handle no responders
-        if msg.headers and msg.headers.get(api.Header.STATUS) == NO_RESPONDERS_STATUS:
+        if msg.status == NO_RESPONDERS_STATUS:
             future.set_exception(nats.js.errors.NoStreamResponseError)
             return
 
@@ -702,7 +702,14 @@ class JetStreamContext(JetStreamManager):
 
     @classmethod
     def is_status_msg(cls, msg: Optional[Msg]) -> Optional[str]:
-        if msg is None or msg.headers is None:
+        if msg is None:
+            return None
+        # Prefer the status parsed from the protocol status line so a
+        # business-level ``Status`` header on a regular data message is not
+        # mistaken for a JetStream status message.
+        if msg.status is not None:
+            return msg.status
+        if msg.headers is None:
             return None
         return msg.headers.get(api.Header.STATUS)
 

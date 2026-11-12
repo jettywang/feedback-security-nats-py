@@ -355,6 +355,79 @@ class ProcessHeadersTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hdr, {"a": "nospace", "b": "tab", "c": "triple"})
 
 
+class ParseHeadersStatusSeparationTest(unittest.IsolatedAsyncioTestCase):
+    """The protocol status line must stay separate from business headers.
+
+    `_parse_headers` returns `(headers, status, description)` where only the
+    first line of the HMSG block (e.g. `NATS/1.0 503 No Responders`) can set
+    `status`. A business-level `Status` header never does.
+    """
+
+    async def test_business_status_header_leaves_status_none(self):
+        nc = NATS()
+        hdr, status, description = await nc._parse_headers(
+            b"NATS/1.0\r\nStatus: 503\r\nFoo: bar\r\n\r\n"
+        )
+        self.assertIsNone(status)
+        self.assertIsNone(description)
+        self.assertEqual(hdr, {"Status": "503", "Foo": "bar"})
+
+    async def test_inline_status_is_reported_separately(self):
+        nc = NATS()
+        hdr, status, description = await nc._parse_headers(b"NATS/1.0 503 No Responders\r\n\r\n")
+        self.assertEqual(status, "503")
+        self.assertEqual(description, "No Responders")
+        self.assertIsNone(hdr)
+
+    async def test_inline_status_without_description(self):
+        nc = NATS()
+        hdr, status, description = await nc._parse_headers(b"NATS/1.0 404\r\n\r\n")
+        self.assertEqual(status, "404")
+        self.assertIsNone(description)
+        self.assertIsNone(hdr)
+
+    async def test_inline_status_and_business_header_do_not_clobber(self):
+        nc = NATS()
+        raw = b"NATS/1.0 503 No Responders\r\nStatus: 418\r\nNote: x\r\n\r\n"
+        hdr, status, description = await nc._parse_headers(raw)
+        self.assertEqual(status, "503")
+        self.assertEqual(description, "No Responders")
+        # Business header keeps its own value rather than being overwritten.
+        self.assertEqual(hdr, {"Status": "418", "Note": "x"})
+
+    async def test_mixed_case_duplicate_business_headers_both_kept(self):
+        nc = NATS()
+        raw = b"NATS/1.0\r\nStatus: 503\r\nstatus: 200\r\nX: one\r\nx: two\r\n\r\n"
+        hdr, status, description = await nc._parse_headers(raw)
+        self.assertIsNone(status)
+        self.assertEqual(hdr["Status"], "503")
+        self.assertEqual(hdr["status"], "200")
+        self.assertEqual(hdr["X"], "one")
+        self.assertEqual(hdr["x"], "two")
+
+    async def test_heartbeat_status_line_with_headers(self):
+        nc = NATS()
+        raw = b"NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 1\r\nNats-Last-Stream: 2\r\n\r\n"
+        hdr, status, description = await nc._parse_headers(raw)
+        self.assertEqual(status, "100")
+        self.assertEqual(description, "Idle Heartbeat")
+        self.assertEqual(hdr, {"Nats-Last-Consumer": "1", "Nats-Last-Stream": "2"})
+
+    async def test_empty_inputs(self):
+        nc = NATS()
+        self.assertEqual(await nc._parse_headers(b""), (None, None, None))
+        self.assertEqual(await nc._parse_headers(None), (None, None, None))
+
+    async def test_legacy_wrapper_still_surfaces_synthetic_status(self):
+        nc = NATS()
+        # Backwards-compatible contract: inline status remains reachable via headers.
+        hdr = await nc._process_headers(b"NATS/1.0 503 No Responders\r\n\r\n")
+        self.assertEqual(hdr, {"Status": "503", "Description": "No Responders"})
+        # Business headers are untouched by the wrapper.
+        hdr = await nc._process_headers(b"NATS/1.0\r\nStatus: 503\r\n\r\n")
+        self.assertEqual(hdr, {"Status": "503"})
+
+
 class ClientTest(SingleServerTestCase):
     @async_test
     async def test_default_connect(self):
