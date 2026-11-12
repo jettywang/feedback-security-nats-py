@@ -378,6 +378,33 @@ A handler function used to configure a custom *STATS* endpoint.
 
 
 @dataclass
+class ControlSubscriptionConfig:
+    """Selects which control (PING/INFO/STATS) subjects a service subscribes to.
+
+    Each verb is exposed on up to three subjects:
+
+    - ``$SRV.<VERB>`` -- global, every service responds (*all*).
+    - ``$SRV.<VERB>.<name>`` -- every instance of the same-named service responds (*kind*).
+    - ``$SRV.<VERB>.<name>.<id>`` -- only this service instance responds (*instance*).
+
+    Disabling the broader scopes lets a deployment account hold subscribe
+    permissions limited to its own instance subjects, while a dedicated
+    operations account queries a specific instance directly. Combine with
+    broker-side subject ACLs so only the operations account may publish to
+    ``$SRV.>``.
+    """
+
+    all: bool = True
+    """Subscribe to ``$SRV.<VERB>``, responding to queries directed at all services."""
+
+    kind: bool = True
+    """Subscribe to ``$SRV.<VERB>.<name>``, responding to queries directed at all instances of this service name."""
+
+    instance: bool = True
+    """Subscribe to ``$SRV.<VERB>.<name>.<id>``, responding to queries directed at this service instance."""
+
+
+@dataclass
 class ServiceConfig:
     """The configuration of a service."""
 
@@ -401,6 +428,12 @@ class ServiceConfig:
     stats_handler: Optional[StatsHandler] = None
     """
     A handler function used to configure a custom *STATS* endpoint.
+    """
+
+    control_subscriptions: Optional[ControlSubscriptionConfig] = None
+    """
+    Selects which control (PING/INFO/STATS) subjects the service subscribes to.
+    When not set, the service subscribes to all control subjects.
     """
 
     def __post_init__(self) -> None:
@@ -608,6 +641,7 @@ class Service(AsyncContextManager):
         self._metadata = config.metadata or {}
         self._queue_group = config.queue_group
         self._stats_handler = config.stats_handler
+        self._control_subscriptions = config.control_subscriptions or ControlSubscriptionConfig()
 
         self._client = client
         self._subscriptions = {}
@@ -633,27 +667,55 @@ class Service(AsyncContextManager):
             ServiceVerb.STATS: self._handle_stats_request,
         }
 
-        for verb, verb_handler in verb_request_handlers.items():
-            verb_subjects = [
-                (
-                    f"{verb}-all",
-                    control_subject(verb, name=None, id=None, prefix=self._prefix),
-                ),
-                (
-                    f"{verb}-kind",
-                    control_subject(verb, name=self._name, id=None, prefix=self._prefix),
-                ),
-                (
-                    verb,
-                    control_subject(verb, name=self._name, id=self._id, prefix=self._prefix),
-                ),
-            ]
+        control = self._control_subscriptions
 
-            for key, subject in verb_subjects:
-                self._subscriptions[key] = await self._client.subscribe(subject, cb=verb_handler)
+        try:
+            for verb, verb_handler in verb_request_handlers.items():
+                verb_subjects = []
+                if control.all:
+                    verb_subjects.append(
+                        (
+                            f"{verb}-all",
+                            control_subject(verb, name=None, id=None, prefix=self._prefix),
+                        )
+                    )
+                if control.kind:
+                    verb_subjects.append(
+                        (
+                            f"{verb}-kind",
+                            control_subject(verb, name=self._name, id=None, prefix=self._prefix),
+                        )
+                    )
+                if control.instance:
+                    verb_subjects.append(
+                        (
+                            verb,
+                            control_subject(verb, name=self._name, id=self._id, prefix=self._prefix),
+                        )
+                    )
+
+                for key, subject in verb_subjects:
+                    self._subscriptions[key] = await self._client.subscribe(subject, cb=verb_handler)
+        except Exception:
+            # A partially started service must not keep control subscriptions
+            # around: remove the ones already registered so a retry starts
+            # from a clean state.
+            await self._remove_control_subscriptions()
+            raise
 
         self._started = datetime.utcnow()
         await self._client.flush()
+
+    async def _remove_control_subscriptions(self) -> None:
+        """Unsubscribe all registered control subscriptions."""
+        subscriptions = self._subscriptions
+        self._subscriptions = {}
+
+        for subscription in subscriptions.values():
+            try:
+                await subscription.unsubscribe()
+            except Exception:
+                pass
 
     @overload
     async def add_endpoint(self, config: EndpointConfig) -> None: ...

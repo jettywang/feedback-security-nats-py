@@ -88,6 +88,69 @@ if __name__ == '__main__':
     asyncio.run(main())
 ```
 
+## Micro services
+
+The `nats.micro` package implements the NATS microservices framework. Each
+service instance answers PING/INFO/STATS requests on up to three control
+subjects per verb:
+
+- `$SRV.<VERB>` — every service responds (global scope)
+- `$SRV.<VERB>.<name>` — every instance of the same-named service responds
+- `$SRV.<VERB>.<name>.<id>` — only this instance responds
+
+Use `ControlSubscriptionConfig` to restrict which of these the service
+subscribes to. For example, when the deployment account is only allowed to
+subscribe within its own instance scope, disable the global and same-name
+scopes so registration never touches subjects the account may not access:
+
+```python
+from nats.micro import add_service
+from nats.micro.service import ControlSubscriptionConfig, ServiceConfig
+
+service = await add_service(
+    nc,
+    ServiceConfig(
+        name="payments",
+        version="1.0.0",
+        control_subscriptions=ControlSubscriptionConfig(all=False, kind=False),
+    ),
+)
+```
+
+The instance then answers PING/INFO/STATS only on
+`$SRV.<VERB>.payments.<instance-id>`, and a dedicated operations account can
+query that exact instance. Business endpoints are unaffected.
+
+Combine this with broker-side subject ACLs for defense in depth. Restrict the
+deployment account to the instance control scope and its business subjects,
+and let only the operations account publish control queries:
+
+```hcl
+accounts {
+  APP: {
+    users = [
+      { user: deploy, password: deploy, permissions: {
+        subscribe: { allow: ["$SRV.*.payments.>", "svc.>"] }
+        publish:   { allow: ["_INBOX.>"] }
+      }}
+    ]
+  }
+  OPS: {
+    users = [
+      { user: ops, password: ops, permissions: {
+        publish:   { allow: ["$SRV.>", "_INBOX.>"] }
+        subscribe: { allow: ["_INBOX.>"] }
+      }}
+    ]
+  }
+}
+```
+
+With such ACLs, the `deploy` user cannot register the broader
+`$SRV.PING`/`$SRV.PING.payments` subscriptions at all, so scoping the control
+subscriptions client-side avoids registration failures, while the broker
+enforces that only the operations account can publish to `$SRV.>`.
+
 ## JetStream
 
 Starting v2.0.0 series, the client now has JetStream support:

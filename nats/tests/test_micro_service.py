@@ -1,5 +1,6 @@
 import asyncio
 import random
+import unittest
 
 import nats.micro
 from nats.micro import *
@@ -562,6 +563,52 @@ class MicroServiceTest(SingleServerTestCase):
                 assert subject == data["expected_subject"]
 
     @async_test
+    async def test_scoped_control_subscriptions_with_server(self):
+        nc = await nats.connect()
+
+        async def handler(request: Request):
+            await request.respond(b"42")
+
+        svc = await add_service(
+            nc,
+            ServiceConfig(
+                name="ScopedService",
+                version="0.0.1",
+                control_subscriptions=ControlSubscriptionConfig(all=False, kind=False),
+            ),
+        )
+        await svc.add_endpoint(EndpointConfig(name="echo", subject="svc.echo", handler=handler))
+
+        # The global and same-name control subjects have no subscribers.
+        for verb in ("PING", "INFO", "STATS"):
+            with self.assertRaises(nats.errors.NoRespondersError):
+                await nc.request(f"$SRV.{verb}", timeout=1)
+            with self.assertRaises(nats.errors.NoRespondersError):
+                await nc.request(f"$SRV.{verb}.ScopedService", timeout=1)
+
+        # The instance scoped control subjects are still served.
+        for verb, response_type in (
+            ("PING", "io.nats.micro.v1.ping_response"),
+            ("INFO", "io.nats.micro.v1.info_response"),
+            ("STATS", "io.nats.micro.v1.stats_response"),
+        ):
+            response = await nc.request(f"$SRV.{verb}.ScopedService.{svc.id}", timeout=1)
+            payload = json.loads(response.data.decode())
+            assert payload["type"] == response_type
+            assert payload["name"] == "ScopedService"
+            assert payload["id"] == svc.id
+
+        # Business endpoints keep their original behavior.
+        response = await nc.request("svc.echo", b"hello", timeout=1)
+        assert response.data == b"42"
+
+        await svc.stop()
+
+        # Control subscriptions are cleaned up after stop.
+        with self.assertRaises(nats.errors.NoRespondersError):
+            await nc.request(f"$SRV.PING.ScopedService.{svc.id}", timeout=1)
+
+    @async_test
     async def test_custom_queue_group(self):
         async def noop_handler(request: Request):
             pass
@@ -700,3 +747,236 @@ class MicroServiceTest(SingleServerTestCase):
         await sub.unsubscribe()
         for svc in svcs:
             await svc.stop()
+
+
+class FakeSubscription:
+    """Minimal stand-in for nats.aio.subscription.Subscription."""
+
+    def __init__(self, client, sid, subject, queue, cb):
+        self._client = client
+        self.sid = sid
+        self.subject = subject
+        self.queue = queue
+        self.cb = cb
+        self.unsubscribed = False
+        self.drained = False
+
+    async def unsubscribe(self, limit=0):
+        self.unsubscribed = True
+        self._client.unsubscribed_subjects.append(self.subject)
+        self._client._deactivate(self.sid)
+
+    async def drain(self):
+        self.drained = True
+        self._client._deactivate(self.sid)
+
+
+class FakeClient:
+    """Minimal stand-in for nats.aio.client.Client.
+
+    Keeps a client-side view of subscriptions (like Client._subs) and a
+    broker-side view of active subjects, so tests can verify what the
+    service actually subscribed and simulate reconnects.
+    """
+
+    def __init__(self):
+        self._nuid = nats.nuid.NUID()
+        self._next_sid = 0
+        self._subscribe_calls = 0
+        self.fail_on_subscribe_call = None
+        self.subscriptions = {}
+        self.server_subjects = {}
+        self.unsubscribed_subjects = []
+        self.flushed = False
+
+    async def subscribe(self, subject="", queue="", cb=None, **kwargs):
+        self._subscribe_calls += 1
+        if self.fail_on_subscribe_call == self._subscribe_calls:
+            raise nats.errors.Error("nats: simulated subscribe failure")
+
+        self._next_sid += 1
+        subscription = FakeSubscription(self, self._next_sid, subject, queue, cb)
+        self.subscriptions[subscription.sid] = subscription
+        self.server_subjects[subscription.sid] = subject
+        return subscription
+
+    def _deactivate(self, sid):
+        self.subscriptions.pop(sid, None)
+        self.server_subjects.pop(sid, None)
+
+    async def flush(self):
+        self.flushed = True
+
+    def simulate_reconnect(self):
+        # The real client re-registers every known subscription with the
+        # server after the connection is re-established.
+        self.server_subjects = {sid: sub.subject for sid, sub in self.subscriptions.items()}
+
+    async def deliver(self, subject, msg):
+        delivered = 0
+        for subscription in list(self.subscriptions.values()):
+            if subscription.subject == subject:
+                await subscription.cb(msg)
+                delivered += 1
+        return delivered
+
+
+class FakeMsg:
+    def __init__(self):
+        self.responses = []
+
+    async def respond(self, data=b""):
+        self.responses.append(data)
+
+
+class MicroControlSubscriptionFakeClientTest(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+
+    def tearDown(self):
+        self.loop.close()
+
+    def make_service(self, client, control_subscriptions=None):
+        config = ServiceConfig(
+            name="test_service",
+            version="0.0.1",
+            control_subscriptions=control_subscriptions,
+        )
+        return Service(client, config)
+
+    @async_test
+    async def test_default_control_subscriptions(self):
+        client = FakeClient()
+        service = self.make_service(client)
+        await service.start()
+
+        expected_subjects = (
+            {f"$SRV.{verb}" for verb in ("PING", "INFO", "STATS")}
+            | {f"$SRV.{verb}.test_service" for verb in ("PING", "INFO", "STATS")}
+            | {f"$SRV.{verb}.test_service.{service.id}" for verb in ("PING", "INFO", "STATS")}
+        )
+
+        assert set(client.server_subjects.values()) == expected_subjects
+        assert client.flushed
+
+        # Control handlers respond on the instance subject.
+        for verb, response_type in (
+            ("PING", "io.nats.micro.v1.ping_response"),
+            ("INFO", "io.nats.micro.v1.info_response"),
+            ("STATS", "io.nats.micro.v1.stats_response"),
+        ):
+            msg = FakeMsg()
+            delivered = await client.deliver(f"$SRV.{verb}.test_service.{service.id}", msg)
+            assert delivered == 1
+            assert len(msg.responses) == 1
+            payload = json.loads(msg.responses[0].decode())
+            assert payload["type"] == response_type
+            assert payload["name"] == "test_service"
+            assert payload["id"] == service.id
+            assert payload["version"] == "0.0.1"
+
+        await service.stop()
+        assert client.server_subjects == {}
+
+    @async_test
+    async def test_scoped_control_subscriptions(self):
+        client = FakeClient()
+        service = self.make_service(
+            client,
+            control_subscriptions=ControlSubscriptionConfig(all=False, kind=False),
+        )
+        await service.start()
+
+        # Only the instance scoped control subjects are subscribed.
+        expected_subjects = {f"$SRV.{verb}.test_service.{service.id}" for verb in ("PING", "INFO", "STATS")}
+        assert set(client.server_subjects.values()) == expected_subjects
+
+        # Business endpoints keep their original behavior.
+        async def handler(request: Request):
+            await request.respond(b"42")
+
+        await service.add_endpoint(EndpointConfig(name="echo", subject="svc.echo", handler=handler))
+
+        endpoint_subs = [sub for sub in client.subscriptions.values() if sub.subject == "svc.echo"]
+        assert len(endpoint_subs) == 1
+        assert endpoint_subs[0].queue == "q"
+
+        # INFO and STATS are still served on the instance subject.
+        info_msg = FakeMsg()
+        await client.deliver(f"$SRV.INFO.test_service.{service.id}", info_msg)
+        info = ServiceInfo.from_dict(json.loads(info_msg.responses[0].decode()))
+        assert info.name == "test_service"
+        assert [endpoint.subject for endpoint in info.endpoints] == ["svc.echo"]
+
+        stats_msg = FakeMsg()
+        await client.deliver(f"$SRV.STATS.test_service.{service.id}", stats_msg)
+        stats = ServiceStats.from_dict(json.loads(stats_msg.responses[0].decode()))
+        assert stats.name == "test_service"
+        assert [endpoint.name for endpoint in stats.endpoints] == ["echo"]
+
+        # The disabled scopes have no subscription at all.
+        assert await client.deliver("$SRV.PING", FakeMsg()) == 0
+        assert await client.deliver("$SRV.PING.test_service", FakeMsg()) == 0
+
+        await service.stop()
+        assert client.server_subjects == {}
+
+    @async_test
+    async def test_control_subscription_registration_failure_cleans_up(self):
+        client = FakeClient()
+        # Fail in the middle of control subscription registration.
+        client.fail_on_subscribe_call = 5
+
+        service = self.make_service(client)
+        with self.assertRaises(nats.errors.Error):
+            await service.start()
+
+        # Subscriptions registered before the failure are cleaned up.
+        assert service._subscriptions == {}
+        assert client.server_subjects == {}
+        assert client.subscriptions == {}
+        # The first four control subscriptions were registered, then removed.
+        assert len(client.unsubscribed_subjects) == 4
+
+        # A retry starts from a clean state and registers everything.
+        client.fail_on_subscribe_call = None
+        await service.start()
+        assert len(client.server_subjects) == 9
+        assert len(service._subscriptions) == 9
+
+        await service.stop()
+        assert client.server_subjects == {}
+
+    @async_test
+    async def test_control_subscriptions_survive_reconnect(self):
+        client = FakeClient()
+        service = self.make_service(
+            client,
+            control_subscriptions=ControlSubscriptionConfig(all=False, kind=False),
+        )
+        await service.start()
+
+        async def handler(request: Request):
+            await request.respond(b"42")
+
+        await service.add_endpoint(EndpointConfig(name="echo", subject="svc.echo", handler=handler))
+
+        # Simulate the broker dropping the subscriptions and the client
+        # re-registering them after a reconnect.
+        client.server_subjects = {}
+        client.simulate_reconnect()
+
+        expected_subjects = {f"$SRV.{verb}.test_service.{service.id}" for verb in ("PING", "INFO", "STATS")}
+        expected_subjects.add("svc.echo")
+        assert set(client.server_subjects.values()) == expected_subjects
+
+        # Handlers still respond after the reconnect.
+        msg = FakeMsg()
+        assert await client.deliver(f"$SRV.PING.test_service.{service.id}", msg) == 1
+        payload = json.loads(msg.responses[0].decode())
+        assert payload["type"] == "io.nats.micro.v1.ping_response"
+
+        # Stopping the service cleans up the re-registered subscriptions.
+        await service.stop()
+        assert client.server_subjects == {}
+        assert client.subscriptions == {}
